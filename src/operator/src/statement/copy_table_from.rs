@@ -32,7 +32,7 @@ use common_telemetry::{debug, tracing};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{
-    CsvSource, FileGroup, FileScanConfigBuilder, FileSource, FileStream, JsonSource,
+    CsvSource, FileGroup, FileScanConfigBuilder, FileSource, FileStream, JsonSource, OnError,
 };
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
@@ -202,6 +202,7 @@ impl StatementExecutor {
         file_schema: SchemaRef,
         file_source: Arc<dyn FileSource>,
         projection: Option<Vec<usize>>,
+        on_error: OnError,
     ) -> Result<DfSendableRecordBatchStream> {
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
@@ -217,7 +218,8 @@ impl StatementExecutor {
             .with_projection(&config)
             .create_file_opener(store, &config, 0);
         let stream = FileStream::new(&config, 0, file_opener, &ExecutionPlanMetricsSet::new())
-            .context(error::BuildFileStreamSnafu)?;
+            .context(error::BuildFileStreamSnafu)?
+            .with_on_error(on_error);
 
         Ok(Box::pin(stream))
     }
@@ -246,6 +248,12 @@ impl StatementExecutor {
                     .with_schema(schema.clone())
                     .with_batch_size(DEFAULT_BATCH_SIZE);
 
+                let on_error = if format.skip_bad_records {
+                    OnError::Skip
+                } else {
+                    OnError::Fail
+                };
+
                 let stream = self
                     .build_file_stream(
                         object_store,
@@ -253,6 +261,7 @@ impl StatementExecutor {
                         schema.clone(),
                         csv_source,
                         Some(projection),
+                        on_error,
                     )
                     .await?;
 
@@ -282,6 +291,7 @@ impl StatementExecutor {
                         schema.clone(),
                         json_source,
                         Some(projection),
+                        OnError::Fail,
                     )
                     .await?;
 
@@ -390,8 +400,16 @@ impl StatementExecutor {
                 .await?;
 
             let file_schema = file_metadata.schema();
+            let align_by_name = match &file_metadata {
+                FileMetadata::Csv { format, .. } => format.has_header,
+                _ => true,
+            };
             let (file_schema_projection, table_schema_projection, compat_schema) =
-                generated_schema_projection_and_compatible_file_schema(file_schema, &table_schema);
+                generated_schema_projection_and_compatible_file_schema(
+                    file_schema,
+                    &table_schema,
+                    align_by_name,
+                );
             let projected_file_schema = Arc::new(
                 file_schema
                     .project(&file_schema_projection)
@@ -549,17 +567,27 @@ fn ensure_schema_compatible(from: &SchemaRef, to: &SchemaRef) -> Result<()> {
 fn generated_schema_projection_and_compatible_file_schema(
     file: &SchemaRef,
     table: &SchemaRef,
+    align_by_name: bool,
 ) -> (Vec<usize>, Vec<usize>, Schema) {
     let mut file_projection = Vec::with_capacity(file.fields.len());
     let mut table_projection = Vec::with_capacity(file.fields.len());
     let mut compatible_fields = file.fields.iter().cloned().collect::<Vec<_>>();
-    for (file_idx, file_field) in file.fields.iter().enumerate() {
-        if let Some((table_idx, table_field)) = table.fields.find(file_field.name()) {
-            file_projection.push(file_idx);
-            table_projection.push(table_idx);
+    if align_by_name {
+        for (file_idx, file_field) in file.fields.iter().enumerate() {
+            if let Some((table_idx, table_field)) = table.fields.find(file_field.name()) {
+                file_projection.push(file_idx);
+                table_projection.push(table_idx);
 
-            // Safety: the compatible_fields has same length as file schema
-            compatible_fields[file_idx] = table_field.clone();
+                // Safety: the compatible_fields has same length as file schema
+                compatible_fields[file_idx] = table_field.clone();
+            }
+        }
+    } else {
+        let limit = file.fields.len().min(table.fields.len());
+        for idx in 0..limit {
+            file_projection.push(idx);
+            table_projection.push(idx);
+            compatible_fields[idx] = table.fields[idx].clone();
         }
     }
 
@@ -754,8 +782,11 @@ mod tests {
             Field::new("c2", DataType::Int16, true),
         ]);
 
-        let (_, tp, _) =
-            generated_schema_projection_and_compatible_file_schema(&file_schema0, &table_schema);
+        let (_, tp, _) = generated_schema_projection_and_compatible_file_schema(
+            &file_schema0,
+            &table_schema,
+            true,
+        );
 
         assert_eq!(table_schema.project(&tp).unwrap(), *compat_schema);
     }
@@ -799,8 +830,35 @@ mod tests {
 
         for test in tests {
             let (fp, tp, _) =
-                generated_schema_projection_and_compatible_file_schema(test.0, test.1);
+                generated_schema_projection_and_compatible_file_schema(test.0, test.1, true);
             assert_eq!(test.0.project(&fp).unwrap(), test.1.project(&tp).unwrap());
         }
+    }
+
+    #[test]
+    fn test_schema_projection_without_headers() {
+        let file_schema = make_test_schema(&[
+            Field::new("column_1", DataType::UInt8, true),
+            Field::new("column_2", DataType::UInt8, true),
+        ]);
+
+        let table_schema = make_test_schema(&[
+            Field::new("c1", DataType::Int16, true),
+            Field::new("c2", DataType::Int16, true),
+            Field::new("c3", DataType::Int16, true),
+        ]);
+
+        let (fp, tp, compat) = generated_schema_projection_and_compatible_file_schema(
+            &file_schema,
+            &table_schema,
+            false,
+        );
+
+        assert_eq!(fp, vec![0, 1]);
+        assert_eq!(tp, vec![0, 1]);
+        assert_eq!(
+            compat.project(&fp).unwrap(),
+            table_schema.project(&tp).unwrap()
+        );
     }
 }

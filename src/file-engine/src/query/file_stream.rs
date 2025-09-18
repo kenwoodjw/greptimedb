@@ -23,7 +23,8 @@ use datafusion::common::ToDFSchema;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{
-    CsvSource, FileGroup, FileScanConfigBuilder, FileSource, FileStream, JsonSource, ParquetSource,
+    CsvSource, FileGroup, FileScanConfigBuilder, FileSource, FileStream, JsonSource, OnError,
+    ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_expr::create_physical_expr;
@@ -48,6 +49,7 @@ fn build_record_batch_stream(
     file_schema: Arc<ArrowSchema>,
     limit: Option<usize>,
     file_source: Arc<dyn FileSource>,
+    on_error: OnError,
 ) -> Result<SendableRecordBatchStream> {
     let files = scan_plan_config
         .files
@@ -76,7 +78,8 @@ fn build_record_batch_stream(
         file_opener,
         &ExecutionPlanMetricsSet::new(),
     )
-    .context(error::BuildStreamSnafu)?;
+    .context(error::BuildStreamSnafu)?
+    .with_on_error(on_error);
     let adapter = RecordBatchStreamAdapter::try_new(Box::pin(stream))
         .context(error::BuildStreamAdapterSnafu)?;
     Ok(Box::pin(adapter))
@@ -95,7 +98,13 @@ fn new_csv_stream(
         .with_schema(file_schema.clone())
         .with_batch_size(DEFAULT_BATCH_SIZE);
 
-    build_record_batch_stream(config, file_schema, limit, csv_source)
+    let on_error = if format.skip_bad_records {
+        OnError::Skip
+    } else {
+        OnError::Fail
+    };
+
+    build_record_batch_stream(config, file_schema, limit, csv_source, on_error)
 }
 
 fn new_json_stream(config: &ScanPlanConfig) -> Result<SendableRecordBatchStream> {
@@ -105,7 +114,7 @@ fn new_json_stream(config: &ScanPlanConfig) -> Result<SendableRecordBatchStream>
     let limit = config.filters.is_empty().then_some(config.limit).flatten();
 
     let file_source = JsonSource::new().with_batch_size(DEFAULT_BATCH_SIZE);
-    build_record_batch_stream(config, file_schema, limit, file_source)
+    build_record_batch_stream(config, file_schema, limit, file_source, OnError::Fail)
 }
 
 fn new_parquet_stream_with_exec_plan(config: &ScanPlanConfig) -> Result<SendableRecordBatchStream> {
@@ -173,7 +182,7 @@ fn new_orc_stream(config: &ScanPlanConfig) -> Result<SendableRecordBatchStream> 
     let limit = config.filters.is_empty().then_some(config.limit).flatten();
 
     let file_source = OrcSource::default().with_batch_size(DEFAULT_BATCH_SIZE);
-    build_record_batch_stream(config, file_schema, limit, file_source)
+    build_record_batch_stream(config, file_schema, limit, file_source, OnError::Fail)
 }
 
 #[derive(Debug, Clone)]

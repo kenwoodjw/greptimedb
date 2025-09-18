@@ -39,6 +39,7 @@ pub struct CsvFormat {
     pub delimiter: u8,
     pub schema_infer_max_record: Option<usize>,
     pub compression_type: CompressionType,
+    pub skip_bad_records: bool,
 }
 
 impl TryFrom<&HashMap<String, String>> for CsvFormat {
@@ -71,11 +72,28 @@ impl TryFrom<&HashMap<String, String>> for CsvFormat {
                     .build()
                 })?);
         };
-        if let Some(has_header) = value.get(file_format::FORMAT_HAS_HEADER) {
+        if let Some(headers) = value.get(file_format::FORMAT_HEADERS) {
+            format.has_header = headers.parse().map_err(|_| {
+                error::ParseFormatSnafu {
+                    key: file_format::FORMAT_HEADERS,
+                    value: headers,
+                }
+                .build()
+            })?;
+        } else if let Some(has_header) = value.get(file_format::FORMAT_HAS_HEADER) {
             format.has_header = has_header.parse().map_err(|_| {
                 error::ParseFormatSnafu {
                     key: file_format::FORMAT_HAS_HEADER,
                     value: has_header,
+                }
+                .build()
+            })?;
+        }
+        if let Some(skip_bad_records) = value.get(file_format::FORMAT_SKIP_BAD_RECORDS) {
+            format.skip_bad_records = skip_bad_records.parse().map_err(|_| {
+                error::ParseFormatSnafu {
+                    key: file_format::FORMAT_SKIP_BAD_RECORDS,
+                    value: skip_bad_records,
                 }
                 .build()
             })?;
@@ -91,6 +109,7 @@ impl Default for CsvFormat {
             delimiter: b',',
             schema_infer_max_record: Some(file_format::DEFAULT_SCHEMA_INFER_MAX_RECORD),
             compression_type: CompressionType::Uncompressed,
+            skip_bad_records: false,
         }
     }
 }
@@ -160,8 +179,8 @@ mod tests {
 
     use super::*;
     use crate::file_format::{
-        FORMAT_COMPRESSION_TYPE, FORMAT_DELIMITER, FORMAT_HAS_HEADER,
-        FORMAT_SCHEMA_INFER_MAX_RECORD, FileFormat,
+        FORMAT_COMPRESSION_TYPE, FORMAT_DELIMITER, FORMAT_HAS_HEADER, FORMAT_HEADERS,
+        FORMAT_SCHEMA_INFER_MAX_RECORD, FORMAT_SKIP_BAD_RECORDS, FileFormat,
     };
     use crate::test_util::{format_schema, test_store};
 
@@ -254,7 +273,9 @@ mod tests {
             ),
             (FORMAT_COMPRESSION_TYPE.to_string(), "zstd".to_string()),
             (FORMAT_DELIMITER.to_string(), b'\t'.to_string()),
-            (FORMAT_HAS_HEADER.to_string(), "false".to_string()),
+            (FORMAT_HAS_HEADER.to_string(), "true".to_string()),
+            (FORMAT_HEADERS.to_string(), "false".to_string()),
+            (FORMAT_SKIP_BAD_RECORDS.to_string(), "true".to_string()),
         ]);
         let format = CsvFormat::try_from(&map).unwrap();
 
@@ -265,7 +286,12 @@ mod tests {
                 schema_infer_max_record: Some(2000),
                 delimiter: b'\t',
                 has_header: false,
+                skip_bad_records: true,
             }
         );
+
+        let invalid =
+            HashMap::from([(FORMAT_SKIP_BAD_RECORDS.to_string(), "not_bool".to_string())]);
+        assert!(CsvFormat::try_from(&invalid).is_err());
     }
 }
